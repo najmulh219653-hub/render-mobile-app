@@ -1,7 +1,7 @@
 {
-  "name": "render-express-app",
+  "name": "render-telegram-bot",
   "version": "1.0.0",
-  "description": "A simple Node.js server for Render deployment that includes static file serving and environment variable loading for a bot token.",
+  "description": "A simple Telegram bot deployed on Render using Node.js and Express.",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "telegraf": "^4.16.1"
   }
 }
