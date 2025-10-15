@@ -1,71 +1,72 @@
-// Import necessary modules using ES Module syntax
 import express from 'express';
-import dotenv from 'dotenv';
-import path from 'path';
+import * as path from 'path';
 import { fileURLToPath } from 'url';
-import { dirname } from 'path';
+import 'dotenv/config'; // To load TELEGRAM_BOT_TOKEN locally
+import { Telegraf } from 'telegraf'; // Telegraf library for bot logic
 
-// --- ES Module Path Setup ---
-// Define __dirname equivalent for ES Modules to correctly handle file paths
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-// Load environment variables from .env file (for local testing only)
-// This will pull TELEGRAM_BOT_TOKEN if running locally.
-dotenv.config();
-
-// --- Initialization ---
+// --- Express Server Setup ---
 const app = express();
+// Render automatically provides a PORT environment variable
+const PORT = process.env.PORT || 3000; 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Set the port. Render automatically provides a PORT environment variable.
-const PORT = process.env.PORT || 3000;
-
-// Get the Bot Token from environment variables (from Render or .env)
+// Access the bot token from environment variables (set in Render dashboard)
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
-// --- Middleware ---
-// Middleware to parse JSON bodies
-app.use(express.json());
+if (!BOT_TOKEN) {
+  // This error will appear in Render logs if the token is missing
+  console.error('❌ ERROR: TELEGRAM_BOT_TOKEN is not set in environment variables. Bot will not function.');
+  process.exit(1);
+}
 
-// Serve static files (like index.html, CSS, images) from the 'public' directory
-// When a user visits the root URL ('/'), Express serves 'public/index.html'
+// Initialize Telegraf bot
+const bot = new Telegraf(BOT_TOKEN);
+
+// --- Bot Logic ---
+
+// Responds to the /start command
+bot.start((ctx) => {
+  ctx.reply('👋 নমস্কার! আপনার Render ডিপ্লয় করা Telegram Bot সফলভাবে চলছে! আপনি এখন এখানে আপনার কাস্টম লজিক যুক্ত করতে পারেন।');
+  console.log(`[BOT] Received /start from ${ctx.from.id}`);
+});
+
+// Simple text handler (responds to any non-command text)
+bot.on('text', (ctx) => {
+  ctx.reply(`আপনি লিখেছেন: "${ctx.message.text}"। আমি একটি সাধারণ রিপ্লাই দিচ্ছি।`);
+});
+
+// --- Middleware and Routing ---
+
+// 1. Static file serving (for public/index.html)
 app.use(express.static(path.join(__dirname, 'public')));
 
-// --- Routes (API Endpoints) ---
+// 2. Body Parser for Webhook
+app.use(express.json());
 
-// A simple test API route
+// 3. Telegram Webhook Setup (CRITICAL FOR RENDER)
+// Telegram sends updates to this path: /BOT_TOKEN
+app.post(`/${BOT_TOKEN}`, (req, res) => {
+  // Pass the incoming update to the Telegraf bot handler
+  bot.handleUpdate(req.body, res);
+  // Send 200 OK immediately to avoid Telegram retries
+  res.sendStatus(200); 
+});
+
+// 4. Health Check / Test Route
 app.get('/test', (req, res) => {
-  res.status(200).json({ 
-    status: 'ok',
+  const tokenDisplay = BOT_TOKEN.substring(0, 4) + '...' + BOT_TOKEN.substring(BOT_TOKEN.length - 4);
+  res.json({
+    status: 'Running',
     message: 'Testing route is working correctly!',
-    port: PORT
+    botTokenLoaded: tokenDisplay,
+    port: PORT,
+    webhookListener: `/${BOT_TOKEN}`
   });
 });
-
-// NOTE: You would integrate your actual Telegram bot logic here.
-// Example: Setting up a webhook to handle messages from Telegram
-/*
-app.post('/webhook', (req, res) => {
-    // Process the incoming Telegram update (req.body)
-    console.log('Received Telegram update:', req.body);
-    // Respond quickly to Telegram to avoid timeouts
-    res.status(200).send('OK'); 
-});
-*/
 
 // --- Server Start ---
 
 app.listen(PORT, () => {
-  console.log(`✅ Express Server is listening on port ${PORT}`);
-  
-  // Confirmation message for Bot Token loading
-  if (BOT_TOKEN) {
-    // Display a masked version of the token for security in the console
-    const tokenDisplay = BOT_TOKEN.substring(0, 4) + '...' + BOT_TOKEN.substring(BOT_TOKEN.length - 4);
-    console.log(`🤖 Telegram Bot Token Loaded: ${tokenDisplay}`);
-  } else {
-    // Log an error if the token is missing
-    console.error("❌ ERROR: TELEGRAM_BOT_TOKEN not found in environment variables!");
-    console.error("   Please ensure you set the variable in Render's dashboard.");
-  }
+  console.log(`✅ Server is running on port ${PORT}`);
+  console.log(`[INFO] Bot ready to handle updates via webhook at: /${BOT_TOKEN}`);
 });
