@@ -1,0 +1,6 @@
+# .env
+.env
+# SQLite
+Money_tree.db
+pycache_/
+*.pyc
