@@ -1,6 +1,4 @@
-DATABASE_URL="আপনার_কপি_করা_PostgreSQL_URL_এখানে_বসবে"
-.env
-# SQLite
-Money_tree.db
-pycache_/
-*.pyc
+# gitignore
+env
+money_tree.db
+-pycache_/
