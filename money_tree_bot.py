@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 """
-Money Tree Telegram Bot
-Features:
- - /start with optional referral: /start <ref_telegram_id>
- - give one-time Tk 50 bonus
- - main menu with buttons: Start Earning, Referrals, Withdraw, Tutorial
- - simulate "Watch Ad" task and credit user
- - daily task limit tracking (default 30)
- - referral link generation & count
- - withdraw requests saved and sent to admin for review
- - uses SQLite for persistence
+SmartEarnbdBot - Updated for PostgreSQL (psycopg2) and Render deployment.
 """
 
 import logging
 import os
-import sqlite3
 import datetime
+# PostgreSQL Libraries
+import psycopg2 
+from urllib.parse import urlparse
+# Telegram Libraries
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -36,7 +30,8 @@ from telegram.ext import (
 
 # Load env
 load_dotenv()
-# Check and convert to appropriate types, falling back to defaults if not set
+
+# --- CONFIGURATION (Environment Variables) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)
 REF_BONUS = int(os.getenv("REF_BONUS") or 10)
@@ -45,65 +40,83 @@ DAILY_TASK_LIMIT = int(os.getenv("DAILY_TASK_LIMIT") or 30)
 SIGNUP_BONUS = int(os.getenv("SIGNUP_BONUS") or 50) 
 TASK_REWARD = int(os.getenv("TASK_REWARD") or 5) 
 
+# --- POSTGRES SETUP ---
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is not set in environment variables.")
+
+# Parse URL for psycopg2 connection
+try:
+    url = urlparse(DATABASE_URL)
+    DB_PARAMS = {
+        'database': url.path[1:],
+        'user': url.username,
+        'password': url.password,
+        'host': url.hostname,
+        'port': url.port,
+        'sslmode': 'require' # Neon/Render usually requires SSL
+    }
+except Exception as e:
+     raise ValueError(f"Invalid DATABASE_URL format: {e}")
+
+
 # Logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# DB init
-DB_PATH = "money_tree.db"
+
+# --- DB CONNECTION & HELPERS ---
+
+def get_conn():
+    """Establishes and returns a PostgreSQL connection."""
+    return psycopg2.connect(**DB_PARAMS)
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    """Initializes tables using PostgreSQL syntax."""
+    conn = get_conn()
     cur = conn.cursor()
-    # users table (Added tasks_done_date, tasks_done_count)
-    cur.execute(
-        """
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        telegram_id INTEGER UNIQUE,
-        first_name TEXT,
-        username TEXT,
-        balance INTEGER DEFAULT 0,
-        bonus_given INTEGER DEFAULT 0,
-        referred_by INTEGER DEFAULT NULL,
-        referrals_count INTEGER DEFAULT 0,
-        tasks_done_date TEXT DEFAULT NULL,
-        tasks_done_count INTEGER DEFAULT 0,
-        created_at TEXT
-    )
-    """
-    )
-    # withdrawals table (status added)
-    cur.execute(
-        """
-    CREATE TABLE IF NOT EXISTS withdrawals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        telegram_id INTEGER,
-        method TEXT,
-        account TEXT,
-        amount INTEGER,
-        status TEXT DEFAULT 'pending',
-        created_at TEXT,
-        processed_at TEXT DEFAULT NULL
-    )
-    """
-    )
+    
+    # Using BIGSERIAL for auto-increment and TIMESTAMP WITH TIME ZONE for time data
+    cur.execute("""
+        -- users table
+        CREATE TABLE IF NOT EXISTS users (
+            id BIGSERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE NOT NULL,
+            first_name TEXT,
+            username TEXT,
+            balance BIGINT DEFAULT 0, 
+            bonus_given INTEGER DEFAULT 0,
+            referred_by BIGINT DEFAULT NULL,
+            referrals_count INTEGER DEFAULT 0,
+            tasks_done_date TEXT DEFAULT NULL,
+            tasks_done_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
+        
+        -- withdrawals table
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id BIGSERIAL PRIMARY KEY,
+            telegram_id BIGINT,
+            method TEXT,
+            account TEXT,
+            amount BIGINT,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            processed_at TIMESTAMP WITH TIME ZONE DEFAULT NULL
+        );
+    """)
     conn.commit()
     conn.close()
 
 
-def get_conn():
-    return sqlite3.connect(DB_PATH)
-
-
-# Helper DB functions
 def get_user(telegram_id):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE telegram_id=?", (telegram_id,))
+    # Note: Using %s placeholder for psycopg2
+    cur.execute("SELECT * FROM users WHERE telegram_id=%s", (telegram_id,)) 
     row = cur.fetchone()
     conn.close()
     return row
@@ -112,36 +125,34 @@ def get_user(telegram_id):
 def add_user(telegram_id, first_name="", username="", referred_by=None):
     conn = get_conn()
     cur = conn.cursor()
-    now = datetime.datetime.utcnow().isoformat()
+    # Insert new user
     cur.execute(
-        "INSERT OR IGNORE INTO users (telegram_id, first_name, username, referred_by, created_at) VALUES (?,?,?,?,?)",
-        (telegram_id, first_name, username, referred_by, now),
+        "INSERT INTO users (telegram_id, first_name, username, referred_by) VALUES (%s, %s, %s, %s) ON CONFLICT (telegram_id) DO NOTHING",
+        (telegram_id, first_name, username, referred_by),
     )
-    conn.commit()
-    # if inserted and referred_by set, increment referral count and give ref bonus
-    if referred_by:
-        # check referred_by exists and not self-referral
+    
+    # Handle referral bonus if a new user was inserted AND referred_by is set
+    if referred_by and cur.rowcount > 0: # Check if a row was actually inserted
         if referred_by != telegram_id and get_user(referred_by):
             cur.execute(
-                "UPDATE users SET referrals_count = referrals_count + 1, balance = balance + ? WHERE telegram_id=?",
+                "UPDATE users SET referrals_count = referrals_count + 1, balance = balance + %s WHERE telegram_id=%s",
                 (REF_BONUS, referred_by),
             )
-            conn.commit()
+    conn.commit()
     conn.close()
 
 
 def give_signup_bonus_if_needed(telegram_id, amount=SIGNUP_BONUS): 
-    """Give one-time signup bonus. Return True if given."""
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT bonus_given FROM users WHERE telegram_id=?", (telegram_id,))
+    cur.execute("SELECT bonus_given FROM users WHERE telegram_id=%s", (telegram_id,))
     row = cur.fetchone()
     if not row:
         conn.close()
         return False
     if row[0] == 0:
         cur.execute(
-            "UPDATE users SET balance = balance + ?, bonus_given = 1 WHERE telegram_id=?",
+            "UPDATE users SET balance = balance + %s, bonus_given = 1 WHERE telegram_id=%s",
             (amount, telegram_id),
         )
         conn.commit()
@@ -154,7 +165,7 @@ def give_signup_bonus_if_needed(telegram_id, amount=SIGNUP_BONUS):
 def get_balance(telegram_id):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT balance FROM users WHERE telegram_id=?", (telegram_id,))
+    cur.execute("SELECT balance FROM users WHERE telegram_id=%s", (telegram_id,))
     row = cur.fetchone()
     conn.close()
     return row[0] if row else 0
@@ -163,24 +174,22 @@ def get_balance(telegram_id):
 def add_balance(telegram_id, amount):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("UPDATE users SET balance = balance + ? WHERE telegram_id=?", (amount, telegram_id))
+    cur.execute("UPDATE users SET balance = balance + %s WHERE telegram_id=%s", (amount, telegram_id))
     conn.commit()
     conn.close()
 
 
 def record_task_done(telegram_id):
-    """Increment today's task count (reset if new day). Return (new_count, allowed)"""
     today = datetime.date.today().isoformat()
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT tasks_done_date, tasks_done_count FROM users WHERE telegram_id=?", (telegram_id,))
+    cur.execute("SELECT tasks_done_date, tasks_done_count FROM users WHERE telegram_id=%s", (telegram_id,))
     row = cur.fetchone()
     if not row:
         conn.close()
         return (0, False)
     tdate, tcount = row
     
-    # If tasks_done_date is NULL or it's a new day, reset count
     if tdate is None or tdate != today:
         tcount = 0
         tdate = today
@@ -190,7 +199,7 @@ def record_task_done(telegram_id):
         return (tcount, False)
     
     tcount += 1
-    cur.execute("UPDATE users SET tasks_done_date=?, tasks_done_count=? WHERE telegram_id=?", (today, tcount, telegram_id))
+    cur.execute("UPDATE users SET tasks_done_date=%s, tasks_done_count=%s WHERE telegram_id=%s", (today, tcount, telegram_id))
     conn.commit()
     conn.close()
     return (tcount, True)
@@ -199,21 +208,22 @@ def record_task_done(telegram_id):
 def save_withdraw_request(telegram_id, method, account, amount):
     conn = get_conn()
     cur = conn.cursor()
-    now = datetime.datetime.utcnow().isoformat()
     cur.execute(
-        "INSERT INTO withdrawals (telegram_id, method, account, amount, created_at) VALUES (?,?,?,?,?)",
-        (telegram_id, method, account, amount, now),
+        "INSERT INTO withdrawals (telegram_id, method, account, amount) VALUES (%s, %s, %s, %s) RETURNING id",
+        (telegram_id, method, account, amount),
     )
+    withdraw_id = cur.fetchone()[0] # Fetch the ID of the new row
     conn.commit()
     conn.close()
+    return withdraw_id # Return the ID
+
 
 def update_withdraw_status(withdraw_id, status):
     conn = get_conn()
     cur = conn.cursor()
-    now = datetime.datetime.utcnow().isoformat()
     cur.execute(
-        "UPDATE withdrawals SET status=?, processed_at=? WHERE id=?",
-        (status, now, withdraw_id),
+        "UPDATE withdrawals SET status=%s, processed_at=NOW() WHERE id=%s",
+        (status, withdraw_id),
     )
     conn.commit()
     conn.close()
@@ -221,13 +231,13 @@ def update_withdraw_status(withdraw_id, status):
 def get_withdraw_details(withdraw_id):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT telegram_id, amount FROM withdrawals WHERE id=?", (withdraw_id,))
+    cur.execute("SELECT telegram_id, amount FROM withdrawals WHERE id=%s", (withdraw_id,))
     row = cur.fetchone()
     conn.close()
-    return row # (telegram_id, amount)
+    return row 
 
 
-# --- Telegram Bot Handlers ---
+# --- TELEGRAM HANDLERS (Same as before, with minor updates) ---
 
 MAIN_MENU_KBD = ReplyKeyboardMarkup(
     [
@@ -239,24 +249,19 @@ MAIN_MENU_KBD = ReplyKeyboardMarkup(
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start, optional ref param in args"""
     tg_user = update.effective_user
     tid = tg_user.id
-    args = context.args  # list
+    args = context.args
     referred_by = None
     if args:
-        # try parse referral telegram id
         try:
             referred_by = int(args[0])
-            # Check for self-referral
             if referred_by == tid:
                  referred_by = None
         except Exception:
             referred_by = None
 
-    # create user if not exists
     add_user(tid, first_name=tg_user.first_name or "", username=tg_user.username or "", referred_by=referred_by)
-    # give signup bonus if not given
     given = give_signup_bonus_if_needed(tid, amount=SIGNUP_BONUS)
     text = f"স্বাগতম, {tg_user.first_name or 'বন্ধু'}!\n\n"
     if given:
@@ -271,25 +276,20 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     tid = update.effective_user.id
     
-    # State flags
     expect_withdraw_amount = context.user_data.get("expect_withdraw_amount")
     pending_withdraw_method = context.user_data.get("pending_withdraw_method")
-    # pending_withdraw_amount is used implicitly
 
-    # Clear any pending state if a main menu button is pressed
+
     if text in ["💰 ইনকাম শুরু করুন", "👥 রেফারেল সিস্টেম", "💸 উইথড্র", "ℹ️ টিউটোরিয়াল"]:
+        # Clear state if a main menu button is pressed
         context.user_data.clear()
 
     if text == "💰 ইনকাম শুরু করুন":
         
         balance = get_balance(tid)
-        # get today's tasks count
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT tasks_done_count FROM users WHERE telegram_id=?", (tid,))
-        row = cur.fetchone()
-        conn.close()
-        tdone = row[0] if row else 0
+        user_row = get_user(tid)
+        tdone = user_row[9] if user_row else 0 # tasks_done_count (index 9)
+
         await update.message.reply_text(
             f"ড্যাশবোর্ড\n\nবর্তমান ব্যালেন্স: Tk {balance}\nআজকের টাস্ক সম্পন্ন: {tdone}/{DAILY_TASK_LIMIT}\nপ্রতি টাস্কের রিওয়ার্ড: Tk {TASK_REWARD}\n\nবাছাই করুন:",
             reply_markup=InlineKeyboardMarkup(
@@ -316,19 +316,17 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"আপনার ব্যালেন্স: Tk {balance}\n\nনূ্যতম উইথড্র: Tk {MIN_WITHDRAW}\nকত টাকা উইথড্র করতে চান? (সংখ্যা লিখে পাঠান)\nউদাহরণ: {MIN_WITHDRAW}",
             reply_markup=ReplyKeyboardRemove(),
         )
-        # Set state: expecting amount
         context.user_data["expect_withdraw_amount"] = True
     
     elif text == "ℹ️ টিউটোরিয়াল":
         await update.message.reply_text(
-            "টিউটোরিয়াল:\n\n1) **ইনকাম শুরু করুন** > **বিজ্ঞাপন দেখুন** > বিজ্ঞাপনটি দেখার পর 'I finished' ক্লিক করলে টাকা ক্রেডিট হবে।\n2) **রেফারেল সিস্টেম** থেকে আপনার লিঙ্কটি বন্ধুদের সাথে শেয়ার করুন।\n3) **উইথড্র** করতে নূন্যতম Tk {MIN_WITHDRAW} ব্যালেন্স প্রয়োজন।"
+            f"টিউটোরিয়াল:\n\n1) **ইনকাম শুরু করুন** > **বিজ্ঞাপন দেখুন** > বিজ্ঞাপনটি দেখার পর 'I finished' ক্লিক করলে টাকা ক্রেডিট হবে।\n2) **রেফারেল সিস্টেম** থেকে আপনার লিঙ্কটি বন্ধুদের সাথে শেয়ার করুন।\n3) **উইথড্র** করতে নূন্যতম Tk {MIN_WITHDRAW} ব্যালেন্স প্রয়োজন।"
         )
     
     # --- State Handling for Withdraw ---
     
-    # 1. Expecting Amount
     elif expect_withdraw_amount and text.isdigit():
-        context.user_data["expect_withdraw_amount"] = False # Clear amount state
+        context.user_data["expect_withdraw_amount"] = False
         amount = int(text)
         balance = get_balance(tid)
         
@@ -339,46 +337,35 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("আপনার ব্যালেন্স পর্যাপ্ত নেই।", reply_markup=MAIN_MENU_KBD)
             context.user_data.clear()
         else:
-            # Save amount and ask for method next
             context.user_data["pending_withdraw_amount"] = amount
             
-            # Ask for method
             await update.message.reply_text(
                 "পেমেন্ট পদ্ধতি বাছাই করুন:\n1) Bkash\n2) Nagad\n3) Rocket\n\nউপরোক্ত নামগুলির মধ্যে যেকোনো একটি টাইপ করুন (উদাহরণ: Bkash)",
                 reply_markup=ReplyKeyboardRemove(),
             )
-            context.user_data["expect_withdraw_method"] = True # New state for method
+            context.user_data["expect_withdraw_method"] = True
     
-    # 2. Expecting Method
     elif context.user_data.get("expect_withdraw_method"):
         method = text.strip().lower()
         if method in ["bkash", "nagad", "rocket"]:
-            context.user_data["expect_withdraw_method"] = False # Clear method state
-            context.user_data["pending_withdraw_method"] = text.strip() # Save actual case
+            context.user_data["expect_withdraw_method"] = False
+            context.user_data["pending_withdraw_method"] = text.strip()
             
-            # Ask for account
             await update.message.reply_text(f"আপনার {text.strip()} অ্যাকাউন্ট নম্বর/ইনফো দিন:", reply_markup=ReplyKeyboardRemove())
-            context.user_data["expect_withdraw_account"] = True # New state for account
+            context.user_data["expect_withdraw_account"] = True
         else:
             await update.message.reply_text("দয়া করে সঠিক পেমেন্ট পদ্ধতির নাম লিখুন (Bkash/Nagad/Rocket):")
 
-    # 3. Expecting Account and Finalize
     elif context.user_data.get("expect_withdraw_account"):
-        # This message treated as account and finalize withdraw
-        context.user_data["expect_withdraw_account"] = False # Clear account state
+        context.user_data["expect_withdraw_account"] = False
         
         method = context.user_data.pop("pending_withdraw_method")
         account = text.strip()
         amount = context.user_data.pop("pending_withdraw_amount", 0)
         
-        # Deduct balance immediately (reservation logic)
+        # Deduct balance immediately
         add_balance(tid, -amount)
-        # Save withdraw request and get the ID
-        save_withdraw_request(tid, method, account, amount)
-        # Fetch the newly created withdraw ID for admin notification
-        conn = get_conn()
-        withdraw_id = conn.execute('SELECT MAX(id) FROM withdrawals').fetchone()[0]
-        conn.close()
+        withdraw_id = save_withdraw_request(tid, method, account, amount)
         
         # notify admin
         try:
@@ -405,11 +392,9 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"আপনার উইথড্র রিকোয়েস্ট (Tk {amount}) জমা হয়েছে।\nঅ্যাডমিন রিভিউ করবেন। ⏳", 
             reply_markup=MAIN_MENU_KBD
         )
-        context.user_data.clear() # Clear all withdraw state
+        context.user_data.clear()
     
-    # Fallback/Unknown message
     else:
-        # Clear state if the user sends an arbitrary message outside the flow
         if any(key in context.user_data for key in ["expect_withdraw_amount", "expect_withdraw_method", "expect_withdraw_account"]):
             context.user_data.clear()
             await update.message.reply_text("উইথড্রয়াল রিকোয়েস্ট বাতিল করা হয়েছে। মেনু থেকে আবার চেষ্টা করুন।", reply_markup=MAIN_MENU_KBD)
@@ -424,17 +409,14 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     tid = q.from_user.id
     
     if data == "watch_ad":
-        # Clear any pending state
         context.user_data.clear()
 
-        # Simulate sending an ad (we can't embed real video here). Send instruction and "I finished" button.
         await q.edit_message_text(
             "বিজ্ঞাপন লোড হচ্ছে... (অনুগ্রহ করে ১০ সেকেন্ড অপেক্ষা করুন)।\n\nবিজ্ঞাপন দেখা শেষ হলে 'I finished' চাপুন।",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("I finished - আমি দেখেছি", callback_data="ad_finished")]]),
         )
     
     elif data == "ad_finished":
-        # Check daily limit then credit
         count, allowed = record_task_done(tid)
         
         if not allowed:
@@ -442,7 +424,6 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                                       reply_markup=MAIN_MENU_KBD)
             return
         
-        # credit amount per ad 
         credit = TASK_REWARD
         add_balance(tid, credit)
         balance = get_balance(tid)
@@ -453,7 +434,6 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         )
         
     elif data.startswith("w_approve_") or data.startswith("w_reject_"):
-        # --- Admin Action ---
         if tid != ADMIN_ID:
             await q.answer("আপনি অ্যাডমিন নন।")
             return
@@ -471,7 +451,6 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             update_withdraw_status(withdraw_id, "approved")
             status_text = "✅ অনুমোদিত (পেমেন্ট সম্পন্ন)"
             
-            # Notify user
             try:
                 await context.bot.send_message(
                     chat_id=w_tid,
@@ -484,10 +463,8 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             update_withdraw_status(withdraw_id, "rejected")
             status_text = "❌ বাতিল (ব্যালেন্স রিফান্ড)"
             
-            # Refund the balance to user
             add_balance(w_tid, w_amount)
             
-            # Notify user
             try:
                 await context.bot.send_message(
                     chat_id=w_tid,
@@ -496,14 +473,12 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             except Exception:
                 logger.error(f"Failed to notify user {w_tid} about rejected withdraw {withdraw_id}")
 
-        # Update Admin message
         await q.edit_message_text(
             q.message.text + f"\n\n--- Processed ---\nStatus: {status_text} by Admin.",
-            reply_markup=None # Remove buttons
+            reply_markup=None
         )
 
     elif data == "noop":
-        # do nothing (button placeholder)
         pass 
         
     else:
@@ -511,7 +486,6 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def admin_withdraws(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to list pending withdraws. /withdraws"""
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("আপনি এটি চালাতে পারবেন না।")
         return
@@ -527,9 +501,8 @@ async def admin_withdraws(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         wid, tid, method, account, amount, status, created_at = r
         
-        # Send each withdraw request with action buttons
         await update.message.reply_text(
-            f"--- WID: {wid} ---\nUser: `{tid}`\nAmount: Tk {amount}\nMethod: {method}\nAccount: `{account}`\nRequested: {created_at.split('.')[0]}",
+            f"--- WID: {wid} ---\nUser: `{tid}`\nAmount: Tk {amount}\nMethod: {method}\nAccount: `{account}`\nRequested: {created_at.strftime('%Y-%m-%d %H:%M:%S')}",
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup(
                 [
