@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SmartEarnbdBot - Updated for PostgreSQL (psycopg2) and Render deployment.
+SmartEarnbdBot - FINAL CODE for PostgreSQL (psycopg2) and Render deployment.
 """
 
 import logging
@@ -33,7 +33,8 @@ load_dotenv()
 
 # --- CONFIGURATION (Environment Variables) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)
+# NOTE: Ensure ADMIN_ID is set in Render Environment Variables
+ADMIN_ID = int(os.getenv("ADMIN_ID") or 0) 
 REF_BONUS = int(os.getenv("REF_BONUS") or 10)
 MIN_WITHDRAW = int(os.getenv("MIN_WITHDRAW") or 200)
 DAILY_TASK_LIMIT = int(os.getenv("DAILY_TASK_LIMIT") or 30)
@@ -43,18 +44,21 @@ TASK_REWARD = int(os.getenv("TASK_REWARD") or 5)
 # --- POSTGRES SETUP ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
+    # This will stop the bot if the critical variable is missing
     raise ValueError("DATABASE_URL is not set in environment variables.")
 
 # Parse URL for psycopg2 connection
 try:
     url = urlparse(DATABASE_URL)
+    
+    # DB_PARAMS তৈরি: host, port, user, password, database স্পষ্টভাবে যোগ করা হয়েছে
     DB_PARAMS = {
         'database': url.path[1:],
         'user': url.username,
         'password': url.password,
         'host': url.hostname,
         'port': url.port,
-        'sslmode': 'require' # Neon/Render usually requires SSL
+        'sslmode': 'require' # Neon and Render require SSL/TLS
     }
 except Exception as e:
      raise ValueError(f"Invalid DATABASE_URL format: {e}")
@@ -71,7 +75,13 @@ logger = logging.getLogger(__name__)
 
 def get_conn():
     """Establishes and returns a PostgreSQL connection."""
-    return psycopg2.connect(**DB_PARAMS)
+    try:
+        # ** নিশ্চিত করুন যে **DB_PARAMS এ host ও port আছে
+        return psycopg2.connect(**DB_PARAMS)
+    except psycopg2.OperationalError as e:
+        logger.error(f"Database connection failed: {e}")
+        # সংযোগ ব্যর্থ হলে স্পষ্ট ত্রুটি দেখাবে
+        raise ConnectionError("Failed to connect to the external PostgreSQL database.")
 
 
 def init_db():
@@ -125,14 +135,15 @@ def get_user(telegram_id):
 def add_user(telegram_id, first_name="", username="", referred_by=None):
     conn = get_conn()
     cur = conn.cursor()
-    # Insert new user
+    # Insert new user - ON CONFLICT DO NOTHING prevents errors if user exists
     cur.execute(
         "INSERT INTO users (telegram_id, first_name, username, referred_by) VALUES (%s, %s, %s, %s) ON CONFLICT (telegram_id) DO NOTHING",
         (telegram_id, first_name, username, referred_by),
     )
     
     # Handle referral bonus if a new user was inserted AND referred_by is set
-    if referred_by and cur.rowcount > 0: # Check if a row was actually inserted
+    # cur.rowcount > 0 means the INSERT INTO was successful (new user added)
+    if referred_by and cur.rowcount > 0: 
         if referred_by != telegram_id and get_user(referred_by):
             cur.execute(
                 "UPDATE users SET referrals_count = referrals_count + 1, balance = balance + %s WHERE telegram_id=%s",
@@ -208,6 +219,7 @@ def record_task_done(telegram_id):
 def save_withdraw_request(telegram_id, method, account, amount):
     conn = get_conn()
     cur = conn.cursor()
+    # RETURNING id is PostgreSQL syntax to get the newly created ID
     cur.execute(
         "INSERT INTO withdrawals (telegram_id, method, account, amount) VALUES (%s, %s, %s, %s) RETURNING id",
         (telegram_id, method, account, amount),
@@ -221,6 +233,7 @@ def save_withdraw_request(telegram_id, method, account, amount):
 def update_withdraw_status(withdraw_id, status):
     conn = get_conn()
     cur = conn.cursor()
+    # NOW() is PostgreSQL function for current timestamp
     cur.execute(
         "UPDATE withdrawals SET status=%s, processed_at=NOW() WHERE id=%s",
         (status, withdraw_id),
@@ -237,7 +250,7 @@ def get_withdraw_details(withdraw_id):
     return row 
 
 
-# --- TELEGRAM HANDLERS (Same as before, with minor updates) ---
+# --- TELEGRAM HANDLERS (Same logic as before) ---
 
 MAIN_MENU_KBD = ReplyKeyboardMarkup(
     [
@@ -281,14 +294,14 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
     if text in ["💰 ইনকাম শুরু করুন", "👥 রেফারেল সিস্টেম", "💸 উইথড্র", "ℹ️ টিউটোরিয়াল"]:
-        # Clear state if a main menu button is pressed
         context.user_data.clear()
 
     if text == "💰 ইনকাম শুরু করুন":
         
         balance = get_balance(tid)
         user_row = get_user(tid)
-        tdone = user_row[9] if user_row else 0 # tasks_done_count (index 9)
+        # Index 9 is tasks_done_count in the SELECT * query
+        tdone = user_row[9] if user_row and len(user_row) > 9 else 0 
 
         await update.message.reply_text(
             f"ড্যাশবোর্ড\n\nবর্তমান ব্যালেন্স: Tk {balance}\nআজকের টাস্ক সম্পন্ন: {tdone}/{DAILY_TASK_LIMIT}\nপ্রতি টাস্কের রিওয়ার্ড: Tk {TASK_REWARD}\n\nবাছাই করুন:",
@@ -303,7 +316,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "👥 রেফারেল সিস্টেম":
         ref_link = f"t.me/{context.bot.username}?start={tid}"
         user = get_user(tid)
-        referrals = user[7] if user else 0  # referrals_count
+        referrals = user[7] if user and len(user) > 7 else 0  # referrals_count
         await update.message.reply_text(
             f"আপনার রেফারেল লিঙ্ক:\n`{ref_link}`\n\nআপনি মোট {referrals} জনকে রেফার করেছেন।\nপ্রতিটি সফল রেফারে রেফারারকে Tk {REF_BONUS} বোনাস দেওয়া হয়।",
             parse_mode='Markdown',
@@ -531,6 +544,7 @@ def main():
         logger.error("BOT_TOKEN is not set in the .env file.")
         return
 
+    # Initialize the database and create tables
     init_db()
     
     if not ADMIN_ID:
@@ -540,6 +554,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    # Admin commands check if the user is the ADMIN_ID
     app.add_handler(CommandHandler("withdraws", admin_withdraws, filters=filters.Chat(ADMIN_ID)))
 
     app.add_handler(CallbackQueryHandler(callback_query_handler))
