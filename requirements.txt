@@ -1,2 +1,2 @@
-python-telegram-bot==20.3
-psycopg2-binary==2.9.7
+python-telegram-bot
+python-dotenv
